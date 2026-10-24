@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import messagebox, ttk
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 APP_ID = 1422450  # Deadlock
 SDR_URL = f"https://api.steampowered.com/ISteamApps/GetSDRConfig/v1/?appid={APP_ID}"
@@ -57,9 +57,12 @@ REGIONS = {
 # name -> (allowed POPs or None for all, subtitle).
 # There are no Russian servers: Valve routes players it geolocates to Russia
 # to Frankfurt, Helsinki (no relays at the moment) or Stockholm.
+RU_ROUTES = ["fra", "sto", "hel"]
 PRESETS = {
-    "Россия / СНГ": (["fra", "sto", "hel"], "Франкфурт, Стокгольм"),
+    "Россия / СНГ": (RU_ROUTES, "Франкфурт, Стокгольм"),
     "Европа": (REGIONS["Европа"], "Все серверы Европы"),
+    "Европа без РФ": ([c for c in REGIONS["Европа"] if c not in RU_ROUTES],
+                      "Без Франкфурта и Стокгольма"),
     "Америка": (REGIONS["Северная Америка"], "Все серверы США"),
     "Все серверы": (None, "Без ограничений"),
 }
@@ -619,13 +622,13 @@ class App(tk.Tk):
             card.pack(fill="x", pady=(0, px(8)))
             self.preset_cards[name] = card
 
-        tk.Frame(side, bg=BG, height=px(8)).pack()
-        section_label(side, "ПИНГ")
+        ping_head = tk.Frame(side, bg=BG)
+        ping_head.pack(fill="x", pady=(px(8), 0))
+        tk.Label(ping_head, text="ПИНГ", font=(FONT_BOLD, 8), fg=MUTED, bg=BG).pack(side="left")
+        LinkLabel(ping_head, "↻ обновить", self.refresh_pings, BG).pack(side="right")
         self.best = tk.Label(side, text="Измеряем…", font=(FONT, 9), fg=MUTED, bg=BG,
                              anchor="w", justify="left", wraplength=px(225))
-        self.best.pack(fill="x", pady=(0, px(10)))
-        FlatButton(side, "↻  Обновить пинг", self.refresh_pings,
-                   font=(FONT_BOLD, 9), pady=6).pack(anchor="w")
+        self.best.pack(fill="x", pady=(px(6), 0))
 
         scroll = ScrollFrame(body)
         scroll.pack(side="left", fill="both", expand=True)
