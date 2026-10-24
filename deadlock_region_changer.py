@@ -24,10 +24,21 @@ RULE_NAME = "DeadlockRegionChanger"
 CACHE_FILE = Path(__file__).with_name("sdr_cache.json")
 STATE_FILE = Path(__file__).with_name("blocked.json")
 
+GAME_PROCESSES = ("deadlock.exe", "project8.exe")  # project8 is the old name
+
+# Valve lists some cities several times (its own and partner data centers).
+# They are merged so a city can't stay reachable through its twin.
+CLUSTERS = {
+    "fra": ("Frankfurt (Germany)", ["fra", "dfra"]),
+    "sto": ("Stockholm (Sweden)", ["sto", "sto2", "dsto"]),
+    "lhr": ("London (England)", ["lhr", "dlhr"]),
+    "vie": ("Vienna (Austria)", ["vie", "dvie"]),
+}
+CLUSTER_OF = {m: code for code, (_, members) in CLUSTERS.items() for m in members}
+
 # Groups by continent; unknown POPs fall into "Другое".
 REGIONS = {
-    "Европа": ["ams", "fra", "fsn", "hel", "lhr", "mad", "par", "sto", "sto2",
-               "vie", "waw", "dfra", "dvie", "dsto", "dlhr"],
+    "Европа": ["ams", "fra", "fsn", "hel", "lhr", "mad", "par", "sto", "vie", "waw"],
     "Северная Америка": ["atl", "dfw", "eat", "iad", "lax", "ord", "sea"],
     "Южная Америка": ["eze", "gru", "lim", "scl"],
     "Азия": ["hkg", "seo", "sgp", "tyo", "gum", "bom2", "maa2"],
@@ -37,9 +48,10 @@ REGIONS = {
 }
 
 # name -> (allowed POPs or None for all, subtitle).
-# Russian servers do not exist; players from RU/CIS land on these.
+# There are no Russian servers: Valve routes players it geolocates to Russia
+# to Frankfurt, Helsinki (no relays at the moment) or Stockholm.
 PRESETS = {
-    "Россия / СНГ": (["sto", "sto2", "dsto", "hel", "waw"], "Стокгольм, Варшава"),
+    "Россия / СНГ": (["fra", "sto", "hel"], "Франкфурт, Стокгольм"),
     "Европа": (REGIONS["Европа"], "Все серверы Европы"),
     "Америка": (REGIONS["Северная Америка"], "Все серверы США"),
     "Все серверы": (None, "Без ограничений"),
@@ -131,15 +143,28 @@ def remove_rules():
 
 
 def block_ips(ips):
+    # Also removes rules of older versions (inbound, protocol any).
     remove_rules()
-    # Small chunks keep the remoteip argument within netsh limits.
+    # Small chunks keep the remoteip argument within netsh limits. Only outbound
+    # TCP and UDP are blocked: ICMP stays open, so blocked servers still answer ping.
     for i in range(0, len(ips), 50):
         chunk = ",".join(ips[i:i + 50])
-        for direction in ("out", "in"):
-            ok, out = netsh("add", "rule", f"name={RULE_NAME}", f"dir={direction}",
-                            "action=block", "protocol=any", f"remoteip={chunk}")
+        for protocol in ("TCP", "UDP"):
+            ok, out = netsh("add", "rule", f"name={RULE_NAME}", "dir=out",
+                            "action=block", f"protocol={protocol}", "profile=any",
+                            f"remoteip={chunk}")
             if not ok:
                 raise RuntimeError(out or "netsh завершился с ошибкой")
+
+
+def game_running():
+    result = subprocess.run(
+        ["tasklist", "/FO", "CSV", "/NH"],
+        capture_output=True, text=True, encoding="cp866", errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    out = result.stdout.lower()
+    return any(f'"{name}"' in out for name in GAME_PROCESSES)
 
 
 def ping_ms(ip, timeout_ms=1000):
@@ -168,7 +193,10 @@ def ping_ms(ip, timeout_ms=1000):
 # ------------------------------------------------------------------ data --
 
 def load_pops():
-    """Returns {code: {"desc": str, "ips": [str]}} for POPs with relays."""
+    """Returns ({code: {"desc", "ips", "members"}}, fresh) for POPs with relays.
+
+    fresh is False when Steam was unreachable and the cached list was used."""
+    fresh = True
     try:
         with urllib.request.urlopen(SDR_URL, timeout=10) as resp:
             raw = json.load(resp)
@@ -177,24 +205,38 @@ def load_pops():
         if not CACHE_FILE.exists():
             raise
         raw = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        fresh = False
 
     pops = {}
     for code, pop in raw["pops"].items():
         ips = [r["ipv4"] for r in pop.get("relays", []) if r.get("ipv4")]
-        if ips:
-            pops[code] = {"desc": pop.get("desc", code), "ips": ips}
-    return pops
+        if not ips:
+            continue
+        group = CLUSTER_OF.get(code, code)
+        if group in pops:
+            pops[group]["ips"] += ips
+            pops[group]["members"].append(code)
+        else:
+            desc = CLUSTERS[group][0] if group in CLUSTERS else pop.get("desc", code)
+            pops[group] = {"desc": desc, "ips": ips, "members": [code]}
+    return pops, fresh
 
 
-def load_blocked():
+def load_state():
+    """Returns (blocked codes, blocked IPs) saved by the last apply."""
     try:
-        return set(json.loads(STATE_FILE.read_text(encoding="utf-8")))
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
-        return set()
+        return set(), []
+    if isinstance(data, list):  # older versions saved only the codes
+        data = {"codes": data, "ips": []}
+    codes = {CLUSTER_OF.get(c, c) for c in data.get("codes", [])}
+    return codes, data.get("ips", [])
 
 
-def save_blocked(codes):
-    STATE_FILE.write_text(json.dumps(sorted(codes)), encoding="utf-8")
+def save_state(codes, ips):
+    STATE_FILE.write_text(json.dumps({"codes": sorted(codes), "ips": sorted(ips)}),
+                          encoding="utf-8")
 
 
 def split_desc(desc):
@@ -341,10 +383,12 @@ class ScrollFrame(tk.Frame):
 
 
 class ServerRow(tk.Frame):
-    def __init__(self, master, code, desc, var):
+    def __init__(self, master, code, pop, var):
         super().__init__(master, bg=SURFACE, padx=px(14), pady=px(9))
         self.var = var
-        city, country = split_desc(desc)
+        city, country = split_desc(pop["desc"])
+        if len(pop["members"]) > 1:
+            country = f"{country} · {', '.join(pop['members'])}"
 
         self.badge = tk.Label(self, text=code.upper(), font=(FONT_MONO, 9, "bold"),
                               fg=MUTED, bg=SURFACE_2, width=5, pady=px(3))
@@ -410,18 +454,19 @@ def section_label(master, text):
 # -------------------------------------------------------------------- UI --
 
 class App(tk.Tk):
-    def __init__(self, pops):
+    def __init__(self, pops, fresh=True):
         super().__init__()
         global SCALE
         SCALE = self.winfo_fpixels("1i") / 96
 
         self.title("Deadlock Region Changer")
         self.configure(bg=BG)
-        self.geometry(f"{px(960)}x{px(680)}")
+        self.geometry(f"{px(960)}x{px(720)}")
         self.minsize(px(780), px(520))
 
         self.pops = pops
-        self.applied = load_blocked() & set(pops)
+        self.applied, self.applied_ips = load_state()
+        self.applied &= set(pops)
         self.vars = {}
         self.rows = {}
         self.sections = []
@@ -433,6 +478,7 @@ class App(tk.Tk):
         self.setup_style()
         self.build_header()
         self.build_footer()
+        self.build_banner()
         self.build_body()
 
         for code, var in self.vars.items():
@@ -440,6 +486,12 @@ class App(tk.Tk):
         self.on_change()
         self.refresh_pings()
         threading.Thread(target=self.check_firewall, daemon=True).start()
+        if fresh:
+            threading.Thread(target=self.refresh_rules, daemon=True).start()
+        self.watch_game()
+
+    def blocked_ips(self, codes):
+        return [ip for c in sorted(codes) for ip in self.pops[c]["ips"]]
 
     def check_firewall(self):
         off = firewall_off_profiles()
@@ -447,6 +499,39 @@ class App(tk.Tk):
             self.after(0, self.set_message,
                        f"Брандмауэр Windows выключен ({', '.join(off)}): "
                        "программа предложит включить его при применении", WARN)
+
+    def refresh_rules(self):
+        """Valve changes relay IPs from time to time; old rules would stop working."""
+        codes = set(self.applied)
+        if not codes:
+            return
+        ips = self.blocked_ips(codes)
+        if sorted(ips) == sorted(self.applied_ips):
+            return
+        try:
+            block_ips(ips)
+        except RuntimeError:
+            self.after(0, self.set_message,
+                       "IP-адреса серверов изменились, но обновить правила не удалось", BAD)
+            return
+        save_state(codes, ips)
+        self.applied_ips = ips
+        self.after(0, self.set_message,
+                   "IP-адреса серверов Valve изменились, правила обновлены", GOOD)
+
+    def watch_game(self):
+        def worker():
+            running = game_running()
+            self.after(0, self.show_game_banner, running)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(5000, self.watch_game)
+
+    def show_game_banner(self, running):
+        if running and not self.banner.winfo_ismapped():
+            self.banner.pack(fill="x", padx=px(24), pady=(0, px(16)), before=self.body)
+        elif not running and self.banner.winfo_ismapped():
+            self.banner.pack_forget()
 
     def setup_style(self):
         style = ttk.Style(self)
@@ -479,9 +564,24 @@ class App(tk.Tk):
         self.pill = tk.Label(header, font=(FONT_BOLD, 9), padx=px(12), pady=px(6))
         self.pill.pack(side="right")
 
+    def build_banner(self):
+        # Shown by show_game_banner while Deadlock is running.
+        self.banner = tk.Frame(self, bg="#35191b", highlightthickness=1,
+                               highlightbackground=BAD, padx=px(16), pady=px(8))
+        tk.Label(self.banner, text="⚠", font=(FONT_BOLD, 16), fg=BAD,
+                 bg="#35191b").pack(side="left", padx=(0, px(12)))
+        text = tk.Frame(self.banner, bg="#35191b")
+        text.pack(side="left", fill="x")
+        tk.Label(text, text="Deadlock запущен", font=(FONT_BOLD, 10), fg=TEXT,
+                 bg="#35191b", anchor="w").pack(fill="x")
+        tk.Label(text, text="Игра замеряет пинг при запуске: изменения вступят в силу "
+                            "только после её перезапуска.",
+                 font=(FONT, 9), fg="#e9b3ae", bg="#35191b", anchor="w").pack(fill="x")
+
     def build_body(self):
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True, padx=px(24), pady=(0, px(16)))
+        self.body = body
 
         side = tk.Frame(body, bg=BG, width=px(230))
         side.pack(side="left", fill="y", padx=(0, px(20)))
@@ -495,7 +595,7 @@ class App(tk.Tk):
             card.pack(fill="x", pady=(0, px(8)))
             self.preset_cards[name] = card
 
-        tk.Frame(side, bg=BG, height=px(14)).pack()
+        tk.Frame(side, bg=BG, height=px(8)).pack()
         section_label(side, "ПИНГ")
         self.best = tk.Label(side, text="Измеряем…", font=(FONT, 9), fg=MUTED, bg=BG,
                              anchor="w", justify="left", wraplength=px(225))
@@ -531,7 +631,7 @@ class App(tk.Tk):
             for code in codes:
                 var = tk.BooleanVar(value=code not in self.applied)
                 self.vars[code] = var
-                row = ServerRow(parent, code, self.pops[code]["desc"], var)
+                row = ServerRow(parent, code, self.pops[code], var)
                 row.pack(fill="x", pady=(0, px(4)))
                 self.rows[code] = row
 
@@ -608,7 +708,7 @@ class App(tk.Tk):
         if len(blocked) == len(self.vars):
             self.set_message("Оставьте включённым хотя бы один сервер", BAD)
             return
-        ips = [ip for c in sorted(blocked) for ip in self.pops[c]["ips"]]
+        ips = self.blocked_ips(blocked)
         off = firewall_off_profiles() if ips else []
         if off:
             if not messagebox.askyesno(
@@ -629,14 +729,14 @@ class App(tk.Tk):
         except RuntimeError as e:
             messagebox.showerror("Ошибка брандмауэра", str(e))
             return
-        save_blocked(blocked)
-        self.applied = blocked
+        save_state(blocked, ips)
+        self.applied, self.applied_ips = blocked, ips
         self.set_message(f"Готово: заблокировано {len(ips)} IP. Перезапустите Deadlock.", GOOD)
 
     def reset(self):
         remove_rules()
-        save_blocked(set())
-        self.applied = set()
+        save_state(set(), [])
+        self.applied, self.applied_ips = set(), []
         self.message_text, self.message_color = "Все правила удалены. Перезапустите Deadlock.", GOOD
         self.select_only(self.pops)
 
@@ -667,9 +767,8 @@ class App(tk.Tk):
     def ping_intercepted(self):
         for row in self.rows.values():
             row.set_unknown()
-        self.best.configure(text="Пинг перехватывается (VPN в режиме TUN?). Значения "
-                                 "недоступны, а игра может видеть серверы через VPN.",
-                            fg=WARN)
+        self.best.configure(text="Пинг перехватывается (VPN в режиме TUN?), "
+                                 "значения недоступны.", fg=WARN)
 
     def show_ping(self, code, ms):
         self.rows[code].set_ping(ms)
@@ -690,13 +789,13 @@ def main():
         relaunch_as_admin()
         return
     try:
-        pops = load_pops()
+        pops, fresh = load_pops()
     except Exception as e:
         tk.Tk().withdraw()
         messagebox.showerror("Deadlock Region Changer",
                              f"Не удалось загрузить список серверов Steam:\n{e}")
         return
-    App(pops).mainloop()
+    App(pops, fresh).mainloop()
 
 
 if __name__ == "__main__":
