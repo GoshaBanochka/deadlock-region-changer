@@ -7,6 +7,7 @@ the Windows Firewall, so the game sees only the ones you selected.
 
 import ctypes
 import json
+import os
 import re
 import socket
 import subprocess
@@ -18,11 +19,17 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import messagebox, ttk
 
+__version__ = "1.0.0"
+
 APP_ID = 1422450  # Deadlock
 SDR_URL = f"https://api.steampowered.com/ISteamApps/GetSDRConfig/v1/?appid={APP_ID}"
 RULE_NAME = "DeadlockRegionChanger"
-CACHE_FILE = Path(__file__).with_name("sdr_cache.json")
-STATE_FILE = Path(__file__).with_name("blocked.json")
+FROZEN = getattr(sys, "frozen", False)  # running as the PyInstaller exe
+
+# A one-file exe unpacks itself into a temp folder, so data can't live next to the code.
+DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "DeadlockRegionChanger"
+CACHE_FILE = DATA_DIR / "sdr_cache.json"
+STATE_FILE = DATA_DIR / "blocked.json"
 
 GAME_PROCESSES = ("deadlock.exe", "project8.exe")  # project8 is the old name
 
@@ -95,8 +102,10 @@ def is_admin():
 
 def relaunch_as_admin():
     # An elevated process starts in System32, so the script path must be absolute.
-    script = Path(__file__).resolve()
-    params = " ".join(f'"{a}"' for a in [str(script), *sys.argv[1:]])
+    # The exe asks for admin rights in its manifest and normally never gets here.
+    script = Path(sys.executable if FROZEN else __file__).resolve()
+    args = sys.argv[1:] if FROZEN else [str(script), *sys.argv[1:]]
+    params = " ".join(f'"{a}"' for a in args)
     ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params,
                                         str(script.parent), 1)
 
@@ -192,14 +201,25 @@ def ping_ms(ip, timeout_ms=1000):
 
 # ------------------------------------------------------------------ data --
 
+def fetch_sdr_config(attempts=3):
+    # Requests through a VPN sometimes stall; a retry usually goes through at once.
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(SDR_URL, timeout=10) as resp:
+                return json.load(resp)
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+
+
 def load_pops():
     """Returns ({code: {"desc", "ips", "members"}}, fresh) for POPs with relays.
 
     fresh is False when Steam was unreachable and the cached list was used."""
     fresh = True
     try:
-        with urllib.request.urlopen(SDR_URL, timeout=10) as resp:
-            raw = json.load(resp)
+        raw = fetch_sdr_config()
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         CACHE_FILE.write_text(json.dumps(raw), encoding="utf-8")
     except Exception:
         if not CACHE_FILE.exists():
@@ -235,6 +255,7 @@ def load_state():
 
 
 def save_state(codes, ips):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps({"codes": sorted(codes), "ips": sorted(ips)}),
                           encoding="utf-8")
 
@@ -459,8 +480,11 @@ class App(tk.Tk):
         global SCALE
         SCALE = self.winfo_fpixels("1i") / 96
 
-        self.title("Deadlock Region Changer")
+        self.title(f"Deadlock Region Changer {__version__}")
         self.configure(bg=BG)
+        icon = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "icon.ico"
+        if icon.exists():
+            self.iconbitmap(default=str(icon))
         self.geometry(f"{px(960)}x{px(720)}")
         self.minsize(px(780), px(520))
 
